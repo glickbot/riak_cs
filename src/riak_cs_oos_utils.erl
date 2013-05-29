@@ -26,7 +26,8 @@
 -include("oos_api.hrl").
 
 -export([get_os_user_data/1,
-         user_data/2]).
+         extract_user_data/1,
+         user_ec2_creds/2]).
 
 %% ===================================================================
 %% Public API
@@ -42,21 +43,31 @@ get_os_user_data(UserId) ->
     handle_user_data_response(Response).
 
 -type undef_or_string() :: undefined | string().
--spec user_data(string(), {term(), term()}) -> {undef_or_string(),
-                                                undef_or_string(),
+-spec extract_user_data(undefined | term()) -> {undef_or_string(),
                                                 undef_or_string(),
                                                 undef_or_string()}.
-user_data(UserId, {UserData, _TokenResult}) ->
+extract_user_data(undefined) ->
+    {undefined, undefined, []};
+extract_user_data(UserData) ->
     %% GET /v2.0/users/<user-id>/credentials/OS-EC2
     %% If the user does not have ec2 credentials for the tenant, then set `key_secret'
     %% to `undefined'.
     Path = [<<"user">>, {<<"name">>, <<"email">>, <<"tenantId">>}],
-    {Name, Email, TenantId} = user_binaries_to_lists(
-                                riak_cs_json:value_or_default(
-                                  riak_cs_json:get(UserData, Path),
-                                  {undefined, undefined, []})),
-    {_ ,Secret} = get_ec2_creds(UserId, TenantId),
-    {Name, Email, TenantId, Secret}.
+    user_binaries_to_lists(
+      riak_cs_json:value_or_default(
+        riak_cs_json:get(UserData, Path),
+        {undefined, undefined, []})).
+
+user_ec2_creds(undefined, _) ->
+    {undefined, []};
+user_ec2_creds(UserId, TenantId) ->
+    %% GET /v2.0/users/<user-id>
+    RequestURI = riak_cs_config:os_users_url() ++
+        UserId ++
+        "/credentials/OS-EC2",
+    RequestHeaders = [{"X-Auth-Token", riak_cs_config:os_admin_token()}],
+    Response = httpc:request(get, {RequestURI, RequestHeaders}, [], []),
+    handle_ec2_creds_response(Response, TenantId).
 
 %% ===================================================================
 %% Internal functions
@@ -75,17 +86,6 @@ handle_user_data_response({error, Reason}) ->
     _ = lager:warning("Error occurred requesting user data from keystone. Reason: ~p",
                   [Reason]),
     undefined.
-
-get_ec2_creds(undefined, _) ->
-    {undefined, []};
-get_ec2_creds(UserId, TenantId) ->
-    %% GET /v2.0/users/<user-id>
-    RequestURI = riak_cs_config:os_users_url() ++
-        UserId ++
-        "/credentials/OS-EC2",
-    RequestHeaders = [{"X-Auth-Token", riak_cs_config:os_admin_token()}],
-    Response = httpc:request(get, {RequestURI, RequestHeaders}, [], []),
-    handle_ec2_creds_response(Response, TenantId).
 
 handle_ec2_creds_response({ok, {{_HTTPVer, _Status, _StatusLine}, _, CredsInfo}}, TenantId)
   when _Status >= 200, _Status =< 299 ->

@@ -124,8 +124,9 @@ handle_token_info_response({ok, {{_HTTPVer, _Status, _StatusLine}, _, TokenInfo}
                  UserIdBin ->
                      binary_to_list(UserIdBin)
              end,
-    UserData = riak_cs_oos_utils:get_os_user_data(UserId),
-    {UserId, {UserData, TokenResult}};
+    {Name, Email, TenantId} = riak_cs_oos_utils:extract_user_data(
+                                riak_cs_oos_utils:get_os_user_data(UserId)),
+    {TenantId, {{Name, Email, UserId}, TokenResult}};
 handle_token_info_response({ok, {{_HTTPVer, _Status, _StatusLine}, _, _}}) ->
     failed;
 handle_token_info_response({error, Reason}) ->

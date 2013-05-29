@@ -201,19 +201,21 @@ forbidden(RD, Ctx=#context{auth_module=AuthMod,
 
 maybe_create_user({ok, {_, _}}=UserResult, _, _, _, _, _) ->
     UserResult;
-maybe_create_user({error, NE}, UserId, oos, _, AuthData, RiakPid)
+maybe_create_user({error, NE}, KeyId, oos, _, {UserData, _}, RiakPid)
   when NE =:= not_found;
        NE =:= notfound;
        NE =:= no_user_key ->
-    {Name, Email, KeyId, Secret} = riak_cs_oos_utils:user_data(UserId, AuthData),
+    {Name, Email, UserId} = UserData,
+    {_, Secret} = riak_cs_oos_utils:user_ec2_creds(UserId, KeyId),
     %% Attempt to create a Riak CS user to represent the OS tenant
     riak_cs_utils:create_user(Name, Email, KeyId, Secret),
     riak_cs_utils:get_user(KeyId, RiakPid);
-maybe_create_user({error, NE}, UserId, s3, riak_cs_keystone_auth, AuthData, RiakPid)
+maybe_create_user({error, NE}, KeyId, s3, riak_cs_keystone_auth, {UserData, _}, RiakPid)
   when NE =:= not_found;
        NE =:= notfound;
        NE =:= no_user_key ->
-    {Name, Email, KeyId, Secret} = riak_cs_oos_utils:user_data(UserId, AuthData),
+    {Name, Email, UserId} = UserData,
+    {_, Secret} = riak_cs_oos_utils:user_ec2_creds(UserId, KeyId),
     %% Attempt to create a Riak CS user to represent the OS tenant
     riak_cs_utils:create_user(Name, Email, KeyId, Secret),
     riak_cs_utils:get_user(KeyId, RiakPid);
