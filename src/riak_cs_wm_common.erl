@@ -208,7 +208,7 @@ maybe_create_user({error, NE}, KeyId, oos, _, {UserData, _}, RiakPid)
     {Name, Email, UserId} = UserData,
     {_, Secret} = riak_cs_oos_utils:user_ec2_creds(UserId, KeyId),
     %% Attempt to create a Riak CS user to represent the OS tenant
-    riak_cs_utils:create_user(Name, Email, KeyId, Secret),
+    _ = riak_cs_utils:create_user(Name, Email, KeyId, Secret),
     riak_cs_utils:get_user(KeyId, RiakPid);
 maybe_create_user({error, NE}, KeyId, s3, riak_cs_keystone_auth, {UserData, _}, RiakPid)
   when NE =:= not_found;
@@ -217,7 +217,7 @@ maybe_create_user({error, NE}, KeyId, s3, riak_cs_keystone_auth, {UserData, _}, 
     {Name, Email, UserId} = UserData,
     {_, Secret} = riak_cs_oos_utils:user_ec2_creds(UserId, KeyId),
     %% Attempt to create a Riak CS user to represent the OS tenant
-    riak_cs_utils:create_user(Name, Email, KeyId, Secret),
+    _ = riak_cs_utils:create_user(Name, Email, KeyId, Secret),
     riak_cs_utils:get_user(KeyId, RiakPid);
 maybe_create_user({error, Reason}=Error, _, Api, _, _, _) ->
     _ = lager:error("Retrieval of user record for ~p failed. Reason: ~p",
