@@ -27,7 +27,6 @@
          etag_from_binary/2,
          etag_from_binary_no_quotes/1,
          check_bucket_exists/2,
-         chunked_md5/3,
          close_riak_connection/1,
          close_riak_connection/2,
          create_bucket/5,
@@ -35,6 +34,7 @@
          create_user/4,
          delete_bucket/4,
          delete_object/3,
+         display_name/1,
          encode_term/1,
          from_bucket_name/1,
          get_buckets/1,
@@ -42,6 +42,10 @@
          has_tombstone/1,
          is_admin/1,
          map_keys_and_manifests/3,
+         md5/1,
+         md5_init/0,
+         md5_update/2,
+         md5_final/1,
          reduce_keys_and_manifests/2,
          get_object/3,
          get_manifests/3,
@@ -51,6 +55,7 @@
          get_user_by_index/3,
          get_user_index/3,
          hexlist_to_binary/1,
+         binary_to_hexlist/1,
          json_pp_print/1,
          list_keys/2,
          maybe_log_bucket_owner_error/2,
@@ -61,8 +66,12 @@
          put/3,
          put_with_no_meta/2,
          put_with_no_meta/3,
+         resolve_robj_siblings/1,
          riak_connection/0,
          riak_connection/1,
+         safe_base64_decode/1,
+         safe_base64url_decode/1,
+         safe_list_to_integer/1,
          save_user/3,
          set_bucket_acl/5,
          set_object_acl/5,
@@ -71,13 +80,16 @@
          get_bucket_acl_policy/3,
          second_resolution_timestamp/1,
          timestamp_to_seconds/1,
+         timestamp_to_milliseconds/1,
          to_bucket_name/2,
          update_key_secret/1,
          update_obj_value/2,
-         pid_to_binary/1]).
+         pid_to_binary/1,
+         update_user/3]).
 
 -include("riak_cs.hrl").
 -include_lib("riak_pb/include/riak_pb_kv_codec.hrl").
+-include_lib("riakc/include/riakc.hrl").
 
 -ifdef(TEST).
 -compile(export_all).
@@ -96,25 +108,37 @@
 %% Public API
 %% ===================================================================
 
-
-
-%% @doc Convert the passed binary into a string where the numbers are
-%% represented in hexadecimal (lowercase and 0 prefilled).
+%% @doc Convert the passed binary into a string where the numbers are represented in hexadecimal (lowercase and 0 prefilled).
 -spec binary_to_hexlist(binary()) -> string().
-binary_to_hexlist({Bin, Suffix}) ->
-    binary_to_hexlist(Bin) ++ Suffix;
-binary_to_hexlist(Bin) ->
-    XBin =
-        [ begin
-              Hex = erlang:integer_to_list(X, 16),
-              if
-                  X < 16 ->
-                      lists:flatten(["0" | Hex]);
-                  true ->
-                      Hex
-              end
-          end || X <- binary_to_list(Bin)],
-    string:to_lower(lists:flatten(XBin)).
+binary_to_hexlist(<<>>) ->
+    [];
+binary_to_hexlist(<<A:4, B:4, T/binary>>) ->
+    [num2hexchar(A), num2hexchar(B)|binary_to_hexlist(T)].
+
+num2hexchar(N) when N < 10 ->
+    N + $0;
+num2hexchar(N) when N < 16 ->
+    (N - 10) + $a.
+
+%% @doc Convert the passed binary into a string where the numbers are represented in hexadecimal (lowercase and 0 prefilled).
+-spec hexlist_to_binary(string()) -> binary().
+hexlist_to_binary(HS) ->
+    list_to_binary(hexlist_to_binary_2(HS)).
+
+hexlist_to_binary_2([]) ->
+    [];
+hexlist_to_binary_2([A,B|T]) ->
+    [hex2byte(A, B)|hexlist_to_binary_2(T)].
+
+hex2byte(A, B) ->
+    An = hexchar2num(A),
+    Bn = hexchar2num(B),
+    <<An:4, Bn:4>>.
+
+hexchar2num(C) when $0 =< C, C =< $9 ->
+    C - $0;
+hexchar2num(C) when $a =< C, C =< $f ->
+    (C - $a) + 10.
 
 %% @doc Return a hexadecimal string of `Binary', with double quotes
 %% around it.
@@ -137,14 +161,6 @@ etag_from_binary_no_quotes({Binary, Suffix}) ->
     binary_to_hexlist(Binary) ++ Suffix;
 etag_from_binary_no_quotes(Binary) ->
     binary_to_hexlist(Binary).
-
-%% @doc Convert the passed binary into a string where the numbers are
-%% represented in hexadecimal (lowercase and 0 prefilled).
--spec hexlist_to_binary(string()) -> binary().
-hexlist_to_binary(String) ->
-    Bytes = length(String) div 2,
-    Int = httpd_util:hexlist_to_integer(String),
-    <<Int:(Bytes*8)/integer>>.
 
 %% @doc Release a protobufs connection from the specified
 %% connection pool.
@@ -275,10 +291,12 @@ create_credentialed_user({error, _}=Error, _User) ->
     Error;
 create_credentialed_user({ok, AdminCreds}, User) ->
     {StIp, StPort, StSSL} = stanchion_data(),
-    UserDoc = user_json(User),
     %% Make a call to the user request serialization service.
-    Result = velvet:create_user(StIp, StPort, "application/json", UserDoc,
-        [{ssl, StSSL}, {auth_creds, AdminCreds}]),
+    Result = velvet:create_user(StIp,
+                                StPort,
+                                "application/json",
+                                binary_to_list(riak_cs_json:to_json(User)),
+                                [{ssl, StSSL}, {auth_creds, AdminCreds}]),
     handle_create_user(Result, User).
 
 handle_create_user(ok, User) ->
@@ -292,6 +310,39 @@ handle_create_user({error, {error_status, _, _, ErrorDoc}}, _User) ->
     end;
 handle_create_user({error, _}=Error, _User) ->
     Error.
+
+handle_update_user(ok, User, UserObj, RiakPid) ->
+    _ = save_user(User, UserObj, RiakPid),
+    {ok, User};
+handle_update_user({error, {error_status, _, _, ErrorDoc}}, _User, _, _) ->
+    case riak_cs_config:api() of
+        s3 ->
+            riak_cs_s3_response:error_response(ErrorDoc);
+        oos ->
+            {error, ErrorDoc}
+    end;
+handle_update_user({error, _}=Error, _User, _, _) ->
+    Error.
+
+%% @doc Update a Riak CS user record
+-spec update_user(rcs_user(), riakc_obj:riakc_obj(), pid()) ->
+                         {ok, rcs_user()} | {error, term()}.
+update_user(User, UserObj, RiakPid) ->
+    {StIp, StPort, StSSL} = stanchion_data(),
+    case riak_cs_config:admin_creds() of
+        {ok, AdminCreds} ->
+            Options = [{ssl, StSSL}, {auth_creds, AdminCreds}],
+            %% Make a call to the user request serialization service.
+            Result = velvet:update_user(StIp,
+                                        StPort,
+                                        "application/json",
+                                        User?RCS_USER.key_id,
+                                        binary_to_list(riak_cs_json:to_json(User)),
+                                        Options),
+            handle_update_user(Result, User, UserObj, RiakPid);
+        {error, _}=Error ->
+            Error
+    end.
 
 %% @doc Delete a bucket
 -spec delete_bucket(rcs_user(), riakc_obj:riakc_obj(), binary(), pid()) ->
@@ -474,6 +525,31 @@ map_keys_and_manifests(Object, _, _) ->
 reduce_keys_and_manifests(Acc, _) ->
     Acc.
 
+-type context() :: binary().
+-type digest() :: binary().
+
+-spec md5(string() | binary()) -> digest().
+md5(Bin) when is_binary(Bin) ->
+    md5_final(md5_update(md5_init(), Bin));
+md5(List) when is_list(List) ->
+    md5(list_to_binary(List)).
+
+-spec md5_init() -> context().
+md5_init() ->
+    crypto:md5_init().
+
+-define(MAX_UPDATE_SIZE, (32*1024)).
+
+-spec md5_update(context(), binary()) -> context().
+md5_update(Ctx, Bin) when size(Bin) =< ?MAX_UPDATE_SIZE ->
+    crypto:md5_update(Ctx, Bin);
+md5_update(Ctx, <<Part:?MAX_UPDATE_SIZE/binary, Rest/binary>>) ->
+    md5_update(crypto:md5_update(Ctx, Part), Rest).
+
+-spec md5_final(context()) -> digest().
+md5_final(Ctx) ->
+    crypto:md5_final(Ctx).
+
 %% @doc Get an object from Riak
 -spec get_object(binary(), binary(), pid()) ->
                         {ok, riakc_obj:riakc_obj()} | {error, term()}.
@@ -598,14 +674,14 @@ get_user_by_index(Index, Value, RiakPid) ->
 -spec get_user_index(binary(), binary(), pid()) -> {ok, string()} | {error, term()}.
 get_user_index(Index, Value, RiakPid) ->
     case riakc_pb_socket:get_index(RiakPid, ?USER_BUCKET, Index, Value) of
-        {ok, []} ->
+        {ok, ?INDEX_RESULTS{keys=[]}} ->
             {error, notfound};
-        {ok, [Key | _]} ->
+        {ok, ?INDEX_RESULTS{keys=[Key | _]}} ->
             {ok, binary_to_list(Key)};
         {error, Reason}=Error ->
-            _ = lager:warning("Error occurred trying to query ~p in user index ~p. Reason: ~p", [Value,
-                                                                                                 Index,
-                                                                                                 Reason]),
+            _ = lager:warning("Error occurred trying to query ~p in user"
+                              "index ~p. Reason: ~p",
+                              [Value, Index, Reason]),
             Error
     end.
 
@@ -614,7 +690,7 @@ get_user_index(Index, Value, RiakPid) ->
 has_tombstone({_, <<>>}) ->
     true;
 has_tombstone({MD, _V}) ->
-    dict:is_key(<<"X-Riak-Deleted">>, MD) =:= true.
+    dict:is_key(?MD_DELETED, MD) =:= true.
 
 %% @doc Determine if the specified user account is a system admin.
 -spec is_admin(rcs_user()) -> boolean().
@@ -712,6 +788,55 @@ put_with_no_meta(RiakcPid, RiakcObject, Options) ->
     io:format("put_NO_META LINE ~p ~p\n", [?LINE, erlang:get_stacktrace()]),
     riakc_pb_socket:put(RiakcPid, WithMeta, Options).
 
+
+-type resolve_ok() :: {term(), binary()}.
+-type resolve_error() :: {atom(), atom()}.
+-spec resolve_robj_siblings(RObj::term()) ->
+                      {resolve_ok() | resolve_error(), NeedsRepair::boolean()}.
+
+resolve_robj_siblings(Cs) ->
+    [{BestRating, BestMDV}|Rest] = lists:sort([{rate_a_dict(MD, V), MDV} ||
+                                                  {MD, V} = MDV <- Cs]),
+    if BestRating =< 0 ->
+            {BestMDV, length(Rest) > 0};
+       true ->
+            %% The best has a failing checksum
+            {{no_dict_available, bad_checksum}, true}
+    end.
+
+%% Corruption simulation:
+%% rate_a_dict(_MD, _V) -> case find_rcs_bcsum(_MD) of _ -> 666777888 end.
+
+rate_a_dict(MD, V) ->
+    %% The lower the score, the better.
+    case dict:find(?MD_DELETED, MD) of
+        {ok, true} ->
+            -10;                                % Trump everything
+        error ->
+            case find_rcs_bcsum(MD) of
+                CorrectBCSum when is_binary(CorrectBCSum) ->
+                    case riak_cs_utils:md5(V) of
+                        X when X =:= CorrectBCSum ->
+                            -1;                 % Hooray correctness
+                        _Bad ->
+                            666                 % Boooo
+                    end;
+                _ ->
+                    0                           % OK for legacy data
+            end
+    end.
+
+find_rcs_bcsum(MD) ->
+    case find_md_usermeta(MD) of
+        {ok, Ps} ->
+            proplists:get_value(<<?USERMETA_BCSUM>>, Ps);
+        error ->
+            undefined
+    end.
+
+find_md_usermeta(MD) ->
+    dict:find(?MD_USERMETA, MD).
+
 %% @doc Get a protobufs connection to the riak cluster
 %% from the default connection pool.
 -spec riak_connection() -> {ok, pid()} | {error, term()}.
@@ -734,9 +859,13 @@ riak_connection(Pool) ->
 %% @doc Save information about a Riak CS user
 -spec save_user(rcs_user(), riakc_obj:riakc_obj(), pid()) -> ok | {error, term()}.
 save_user(User, UserObj, RiakPid) ->
-    %% Metadata is currently never updated so if there
-    %% are siblings all copies should be the same
-    UpdUserObj = update_obj_value(UserObj, riak_cs_utils:encode_term(User)),
+    Indexes = [{?EMAIL_INDEX, User?RCS_USER.email},
+               {?ID_INDEX, User?RCS_USER.canonical_id}],
+    MD = dict:store(?MD_INDEX, Indexes, dict:new()),
+    UpdUserObj = riakc_obj:update_metadata(
+                   riakc_obj:update_value(UserObj,
+                                          riak_cs_utils:encode_term(User)),
+                   MD),
     riakc_pb_socket:put(RiakPid, UpdUserObj).
 
 %% @doc Set the ACL for a bucket. Existing ACLs are only
@@ -832,6 +961,10 @@ second_resolution_timestamp({MegaSecs, Secs, _MicroSecs}) ->
 timestamp_to_seconds({MegaSecs, Secs, MicroSecs}) ->
     (MegaSecs * 1000000) + Secs + (MicroSecs / 1000000).
 
+-spec timestamp_to_milliseconds(erlang:timestamp()) -> float().
+timestamp_to_milliseconds(Timestamp) ->
+    timestamp_to_seconds(Timestamp) * 1000.
+
 %% Get the proper bucket name for either the Riak CS object
 %% bucket or the data block bucket.
 -spec to_bucket_name(objects | blocks, binary()) -> binary().
@@ -842,7 +975,7 @@ to_bucket_name(Type, Bucket) ->
         blocks ->
             Prefix = ?BLOCK_BUCKET_PREFIX
     end,
-    BucketHash = crypto:md5(Bucket),
+    BucketHash = md5(Bucket),
     <<Prefix/binary, BucketHash/binary>>.
 
 
@@ -1170,8 +1303,8 @@ generate_canonical_id(_KeyID, undefined) ->
     [];
 generate_canonical_id(KeyID, Secret) ->
     Bytes = 16,
-    Id1 = crypto:md5(KeyID),
-    Id2 = crypto:md5(Secret),
+    Id1 = md5(KeyID),
+    Id2 = md5(Secret),
     binary_to_hexlist(
       iolist_to_binary(<< Id1:Bytes/binary,
                           Id2:Bytes/binary >>)).
@@ -1288,26 +1421,6 @@ serialized_bucket_op(Bucket, ACL, User, UserObj, BucketOp, StatName, RiakPid) ->
             {error, Reason1}
     end.
 
-%% @doc Generate a JSON document to use for a user
-%% creation request.
--spec user_json(rcs_user()) -> string().
-user_json(User) ->
-    ?RCS_USER{name=UserName,
-               display_name=DisplayName,
-               email=Email,
-               key_id=KeyId,
-               key_secret=Secret,
-               canonical_id=CanonicalId} = User,
-    binary_to_list(
-      iolist_to_binary(
-        mochijson2:encode({struct, [{<<"email">>, list_to_binary(Email)},
-                                    {<<"display_name">>, list_to_binary(DisplayName)},
-                                    {<<"name">>, list_to_binary(UserName)},
-                                    {<<"key_id">>, list_to_binary(KeyId)},
-                                    {<<"key_secret">>, list_to_binary(Secret)},
-                                    {<<"canonical_id">>, list_to_binary(CanonicalId)}
-                                   ]}))).
-
 %% @doc Validate an email address.
 -spec validate_email(string()) -> ok | {error, term()}.
 validate_email(EmailAddr) ->
@@ -1383,30 +1496,41 @@ user_record(Name, Email, KeyId, Secret, Buckets) ->
     CanonicalId = generate_canonical_id(KeyId, Secret),
     DisplayName = display_name(Email),
     ?RCS_USER{name=Name,
-               display_name=DisplayName,
-               email=Email,
-               key_id=KeyId,
-               key_secret=Secret,
-               canonical_id=CanonicalId,
-               buckets=Buckets}.
-
+              display_name=DisplayName,
+              email=Email,
+              key_id=KeyId,
+              key_secret=Secret,
+              canonical_id=CanonicalId,
+              buckets=Buckets}.
 
 %% @doc Convert a pid to a binary
 -spec pid_to_binary(pid()) -> binary().
 pid_to_binary(Pid) ->
     list_to_binary(pid_to_list(Pid)).
 
-%% @doc Rapid calls to `md5_update' with largish data blocks (e.g. 1MB)
-%% can lead to erlang scheduler collapse
--spec chunked_md5(binary(), binary(), non_neg_integer()) -> binary().
-chunked_md5(<<>>, Context, _ChunkSize) ->
-    Context;
-chunked_md5(Data, Context, ChunkSize) ->
-    case byte_size(Data) < ChunkSize of
-        true ->
-            crypto:md5_update(Context, Data);
-        false ->
-            <<Chunk:ChunkSize/binary, RestData/binary>> = Data,
-            UpdContext = crypto:md5_update(Context, Chunk),
-            chunked_md5(RestData, UpdContext, ChunkSize)
+-spec safe_base64_decode(binary() | string()) -> {ok, binary()} | bad.
+safe_base64_decode(Str) ->
+    try
+        X = base64:decode(Str),
+        {ok, X}
+    catch _:_ ->
+            bad
+    end.
+
+-spec safe_base64url_decode(binary() | string()) -> {ok, binary()} | bad.
+safe_base64url_decode(Str) ->
+    try
+        X = base64url:decode(Str),
+        {ok, X}
+    catch _:_ ->
+            bad
+    end.
+
+-spec safe_list_to_integer(string()) -> {ok, integer()} | bad.
+safe_list_to_integer(Str) ->
+    try
+        X = list_to_integer(Str),
+        {ok, X}
+    catch _:_ ->
+            bad
     end.
